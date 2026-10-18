@@ -20,6 +20,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "minecraft-data": "^3.92.0",
     "mineflayer": "^4.24.0",
     "mineflayer-armor-manager": "^2.0.1",
@@ -28,6 +29,7 @@
     "mineflayer-pathfinder": "^2.4.5",
     "mineflayer-pvp": "^1.3.2",
     "prismarine-viewer": "^1.29.0",
-    "vec3": "^0.1.10"
+    "vec3": "^0.1.10",
+    "zod": "^4.6.7"
   }
 }
