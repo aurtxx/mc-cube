@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables
+.env
+.env.local
+
+# Logs and debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# Runtime data & testing server
+test-server/
+world/
+world_nether/
+world_the_end/
+
+# OS metadata
+.DS_Store
+Thumbs.db
