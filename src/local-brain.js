@@ -34,6 +34,7 @@ class LocalBrain {
 
   async step() {
     if (this.isProcessing) return;
+    if (this.bot.pathfinder && this.bot.pathfinder.isMoving()) return;
     this.isProcessing = true;
 
     try {
@@ -41,22 +42,23 @@ class LocalBrain {
 
       // Check if target player AURTX is in game
       if (!status.player.online) {
-        // Player not around yet, wait peacefully
         return;
       }
 
       // Check for unhandled player instruction in chat first
       const recentChat = status.player.recentChat;
-      const isNewChat = recentChat && (Date.now() - recentChat.timestamp < 6000);
+      const isNewChat = recentChat && !recentChat.handled && (Date.now() - recentChat.timestamp < 10000);
 
       // Attempt to query local LLM
-      const llmDecision = await this.queryLocalModel(status, recentChat);
+      const llmDecision = await this.queryLocalModel(status, isNewChat ? recentChat : null);
 
       if (llmDecision) {
+        if (recentChat) recentChat.handled = true;
         await this.executeDecision(llmDecision);
       } else {
         // Heuristic Fallback when local LLM server is offline
         await this.heuristicFallback(status, isNewChat ? recentChat.message : null);
+        if (recentChat) recentChat.handled = true;
       }
     } finally {
       this.isProcessing = false;
@@ -147,26 +149,23 @@ What action will you take?`
   }
 
   async heuristicFallback(status, chatMsg) {
-    // 1. Follow direct chat instructions
+    // 1. Follow direct chat instructions if unhandled
     if (chatMsg) {
       const lower = chatMsg.toLowerCase().trim();
-      if (lower === 'hi' || lower === 'hello' || lower === 'hey') {
-        this.bot.actions.sendChat(`Hey ${config.targetPlayer}! I am ready. What are we gathering?`);
+      if (lower.includes('table') || lower.includes('workbench') || lower.includes('craft')) {
+        await this.bot.actions.craftItem('crafting_table', 1);
         return;
       }
       if (lower.includes('come') || lower.includes('follow') || lower.includes('here')) {
         await this.bot.actions.followPlayer(2);
-        this.bot.actions.sendChat(`Coming to you, ${config.targetPlayer}!`);
         return;
       }
       if (lower.includes('wood') || lower.includes('log') || lower.includes('tree')) {
-        this.bot.actions.sendChat(`On it! Harvesting oak logs for us.`);
         await this.bot.actions.collectResource('oak_log', 2);
         return;
       }
       if (lower.includes('stop') || lower.includes('wait')) {
         this.bot.actions.stopAll();
-        this.bot.actions.sendChat('Waiting here.');
         return;
       }
     }
@@ -174,14 +173,17 @@ What action will you take?`
     // 2. Defend if hostiles nearby
     try {
       const defendResult = await this.bot.actions.defendPlayer();
-      if (defendResult.includes('Engaging')) return;
+      if (defendResult && defendResult.includes('Engaging')) return;
     } catch (_) {}
 
-    // 3. Outperform & Mirror Progress
+    // 3. Outperform & Mirror Progress (with cooldown to prevent action spam)
     const playerWood = status.player.estimatedScore.woodLogs;
     const botWood = status.bot.score.woodLogs;
+    const now = Date.now();
+    const canOutperform = !this.lastOutperformTime || (now - this.lastOutperformTime > 30000);
 
-    if (status.player.heldItem.includes('log') || botWood <= playerWood) {
+    if (canOutperform && (status.player.heldItem.includes('log') || (playerWood > 0 && botWood <= playerWood))) {
+      this.lastOutperformTime = now;
       console.log(`[Heuristic Brain] AURTX is gathering wood (${playerWood} logs). Harvesting to compete!`);
       try {
         await this.bot.actions.outperformPlayer();
@@ -192,8 +194,7 @@ What action will you take?`
     }
 
     // 4. Stay close to player if far away (within loaded range)
-    if (status.player.distance > 8 && status.player.distance < 48) {
-      console.log(`[Heuristic Brain] AURTX is ${status.player.distance}m away. Moving closer.`);
+    if (status.player.distance > 10 && status.player.distance < 48) {
       try {
         await this.bot.actions.followPlayer(3);
       } catch (err) {

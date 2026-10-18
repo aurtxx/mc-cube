@@ -5,6 +5,7 @@ const autoEat = require('mineflayer-auto-eat').plugin;
 const armorManager = require('mineflayer-armor-manager');
 const pvp = require('mineflayer-pvp').plugin;
 const mcDataBuilder = require('minecraft-data');
+const { Vec3 } = require('vec3');
 let mineflayerViewer = null;
 try {
   mineflayerViewer = require('prismarine-viewer').mineflayer;
@@ -131,7 +132,76 @@ function createAgent(customOptions = {}) {
       }
     }
 
-    // Guard against NaN lookAt calls which cause 'Invalid move player packet' kicks
+    // --- ROBUST PACKET & PHYSICS PROTECTION ---
+    // Minecraft 1.16.5 kicks clients with "Invalid move player packet received" if:
+    // 1) Any coordinate/angle is NaN or Infinity
+    // 2) Client sends movement packets while server awaits teleport_confirm
+    // 3) Delta distance per tick exceeds 10 blocks (e.g. violent knockback or bad physics)
+    let lastValidPos = null;
+    let lastValidYaw = 0;
+    let lastValidPitch = 0;
+    let awaitingTeleport = false;
+
+    bot._client.on('position', (packet) => {
+      if (packet.teleportId != null) {
+        awaitingTeleport = true;
+      }
+    });
+
+    const origWrite = bot._client.write.bind(bot._client);
+    bot._client.write = (name, params) => {
+      if (name === 'teleport_confirm') {
+        awaitingTeleport = false;
+      }
+
+      // Suppress movement packets if server is waiting for teleport confirmation
+      if (awaitingTeleport && (name === 'position' || name === 'position_look' || name === 'look' || name === 'flying')) {
+        return;
+      }
+
+      // Sanitize coordinates and clamp excessive jumps
+      if (name === 'position' || name === 'position_look') {
+        if (params.x == null || isNaN(params.x) || !isFinite(params.x)) {
+          params.x = lastValidPos ? lastValidPos.x : (bot.entity ? bot.entity.position.x : 0);
+        }
+        if (params.y == null || isNaN(params.y) || !isFinite(params.y)) {
+          params.y = lastValidPos ? lastValidPos.y : (bot.entity ? bot.entity.position.y : 64);
+        }
+        if (params.z == null || isNaN(params.z) || !isFinite(params.z)) {
+          params.z = lastValidPos ? lastValidPos.z : (bot.entity ? bot.entity.position.z : 0);
+        }
+
+        if (lastValidPos) {
+          const dx = params.x - lastValidPos.x;
+          const dy = params.y - lastValidPos.y;
+          const dz = params.z - lastValidPos.z;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          if (distSq > 64) {
+            params.x = lastValidPos.x + Math.max(-4, Math.min(4, dx));
+            params.y = lastValidPos.y + Math.max(-4, Math.min(4, dy));
+            params.z = lastValidPos.z + Math.max(-4, Math.min(4, dz));
+          }
+        }
+        lastValidPos = { x: params.x, y: params.y, z: params.z };
+      }
+
+      if (name === 'look' || name === 'position_look') {
+        if (params.yaw == null || isNaN(params.yaw) || !isFinite(params.yaw)) {
+          params.yaw = lastValidYaw;
+        } else {
+          lastValidYaw = params.yaw;
+        }
+        if (params.pitch == null || isNaN(params.pitch) || !isFinite(params.pitch)) {
+          params.pitch = lastValidPitch;
+        } else {
+          lastValidPitch = params.pitch;
+        }
+      }
+
+      return origWrite(name, params);
+    };
+
+    // Guard lookAt & look from NaN inputs
     const originalLookAt = bot.lookAt.bind(bot);
     bot.lookAt = async (point, force) => {
       if (!point || isNaN(point.x) || isNaN(point.y) || isNaN(point.z)) {
@@ -140,10 +210,41 @@ function createAgent(customOptions = {}) {
       return originalLookAt(point, force);
     };
 
-    // Auto-swim: prevent drowning when spawned in water
+    const originalLook = bot.look.bind(bot);
+    bot.look = async (yaw, pitch, force) => {
+      if (isNaN(yaw) || isNaN(pitch) || !isFinite(yaw) || !isFinite(pitch)) {
+        return;
+      }
+      return originalLook(yaw, pitch, force);
+    };
+
+    // Auto-swim: prevent drowning when in water, but DO NOT hold jump permanently on land
+    let wasInWater = false;
     bot.on('physicsTick', () => {
-      if (bot.entity && bot.entity.isInWater) {
+      if (!bot.entity) return;
+      if (bot.entity.isInWater) {
         bot.setControlState('jump', true);
+        wasInWater = true;
+      } else if (wasInWater) {
+        bot.setControlState('jump', false);
+        wasInWater = false;
+      }
+    });
+
+    // Knockback & Damage Safety: clear control states and pause pathfinding to avoid movement conflict kicks
+    bot.on('entityHurt', (entity) => {
+      if (entity === bot.entity) {
+        console.log(`[Agent] Bot took damage! Health: ${bot.health}/20`);
+        if (bot.pathfinder && bot.pathfinder.isMoving()) {
+          bot.pathfinder.stop();
+        }
+        bot.clearControlStates();
+      }
+    });
+
+    bot._client.on('packet', (data, meta) => {
+      if (meta.name === 'entity_velocity' && data.entityId === bot.entity?.id) {
+        bot.clearControlStates();
       }
     });
 
@@ -190,58 +291,135 @@ function createAgent(customOptions = {}) {
     handleIncomingChat(username, message);
   });
 
-  // Natural Language & Command Parser
-  async function handleIncomingChat(username, rawMessage) {
-    const message = rawMessage.startsWith('!') ? rawMessage.slice(1).trim() : rawMessage.trim();
-    const args = message.split(/ +/);
-    const command = args.shift().toLowerCase();
+  // Natural Language Intent Parser
+  function parseIntent(rawMessage) {
+    const msg = rawMessage.replace(/^[!.\/]/, '').trim().toLowerCase();
 
-    console.log(`[Chat Input from ${username}]: "${rawMessage}" -> command: "${command}"`);
+    // 1. Crafting intents
+    const craftMatch = msg.match(/(?:craft|create|make|build)\s+(?:a\s+|an\s+)?([a-z0-9_ ]+)/i);
+    if (craftMatch) {
+      const rawTarget = craftMatch[1].trim();
+      if (rawTarget.includes('table') || rawTarget.includes('workbench')) return { intent: 'craft', item: 'crafting_table', count: 1 };
+      if (rawTarget.includes('plank')) return { intent: 'craft', item: 'oak_planks', count: 4 };
+      if (rawTarget.includes('stick')) return { intent: 'craft', item: 'stick', count: 4 };
+      if (rawTarget.includes('pickaxe')) return { intent: 'craft', item: rawTarget.includes('stone') ? 'stone_pickaxe' : 'wooden_pickaxe', count: 1 };
+      if (rawTarget.includes('axe')) return { intent: 'craft', item: rawTarget.includes('stone') ? 'stone_axe' : 'wooden_axe', count: 1 };
+      if (rawTarget.includes('sword')) return { intent: 'craft', item: rawTarget.includes('stone') ? 'stone_sword' : 'wooden_sword', count: 1 };
+      if (rawTarget.includes('furnace')) return { intent: 'craft', item: 'furnace', count: 1 };
+      if (rawTarget.includes('torch')) return { intent: 'craft', item: 'torch', count: 4 };
+      return { intent: 'craft', item: rawTarget.replace(/\s+/g, '_'), count: 1 };
+    }
+
+    // 2. Resource collection / Mining
+    const mineMatch = msg.match(/(?:mine|collect|gather|chop|get|harvest|dig)\s+(?:some\s+)?(?:(\d+)\s+)?([a-z0-9_ ]+)/i);
+    if (mineMatch) {
+      const count = mineMatch[1] ? parseInt(mineMatch[1], 10) : 3;
+      const rawTarget = mineMatch[2].trim();
+      if (rawTarget.includes('wood') || rawTarget.includes('log') || rawTarget.includes('tree')) return { intent: 'mine', block: 'oak_log', count };
+      if (rawTarget.includes('stone') || rawTarget.includes('cobble')) return { intent: 'mine', block: 'stone', count };
+      if (rawTarget.includes('iron')) return { intent: 'mine', block: 'iron_ore', count };
+      if (rawTarget.includes('coal')) return { intent: 'mine', block: 'coal_ore', count };
+      if (rawTarget.includes('dirt')) return { intent: 'mine', block: 'dirt', count };
+      return { intent: 'mine', block: rawTarget.replace(/\s+/g, '_'), count };
+    }
+
+    // 3. Follow / Come
+    if (/\b(?:follow|come|here|tp|teleport)\b/i.test(msg)) {
+      return { intent: 'follow' };
+    }
+
+    // 4. Defend / Protect
+    if (/\b(?:defend|protect|guard|attack|kill)\b/i.test(msg)) {
+      return { intent: 'defend' };
+    }
+
+    // 5. Outperform / Compete
+    if (/\b(?:outperform|beat|compete|race)\b/i.test(msg)) {
+      return { intent: 'outperform' };
+    }
+
+    // 6. Stop / Pause
+    if (/\b(?:stop|wait|pause|freeze|stay|halt)\b/i.test(msg)) {
+      return { intent: 'stop' };
+    }
+
+    // 7. Status / HP
+    if (/\b(?:status|hp|health|inventory|info|score)\b/i.test(msg)) {
+      return { intent: 'status' };
+    }
+
+    // 8. Pure greeting
+    if (/\b(?:hi|hello|hey|yo|sup)\b/i.test(msg)) {
+      return { intent: 'greet' };
+    }
+
+    return { intent: 'unknown', text: rawMessage };
+  }
+
+  // Natural Language & Command Dispatcher
+  async function handleIncomingChat(username, rawMessage) {
+    const parsed = parseIntent(rawMessage);
+    console.log(`[Chat Input from ${username}]: "${rawMessage}" -> Intent:`, parsed);
 
     try {
-      if (command === 'hi' || command === 'hello' || command === 'hey') {
-        bot.chat(`Hey ${username}! I am CubeAgent. What are we doing?`);
-        return;
-      }
+      switch (parsed.intent) {
+        case 'greet':
+          bot.chat(`Hey ${username}! I am CubeAgent. What should we do or gather?`);
+          break;
 
-      switch (command) {
-        case 'help':
-          bot.chat('Commands: come, follow, mine <block>, status, outperform, stop');
-          break;
-        case 'come':
-        case 'follow':
-          await bot.actions.followPlayer(2);
-          bot.chat(`Navigating to ${username}!`);
-          break;
-        case 'goto':
-          if (args.length >= 3) {
-            await bot.actions.moveTo(parseFloat(args[0]), parseFloat(args[1]), parseFloat(args[2]));
-          }
-          break;
-        case 'mine':
-        case 'collect':
-          if (args.length >= 1) {
-            const count = args[1] ? parseInt(args[1], 10) : 1;
-            await bot.actions.collectResource(args[0], count);
-          } else {
-            bot.chat('Usage: mine <block_name> [count]');
-          }
-          break;
-        case 'status': {
-          const st = bot.actions.getStatus();
-          bot.chat(`HP:${st.bot.health}/20 Food:${st.bot.food}/20 | Wood: ${st.bot.score.woodLogs} vs ${st.player.estimatedScore.woodLogs}`);
+        case 'craft': {
+          bot.chat(`On it, ${username}! Crafting ${parsed.item}...`);
+          const res = await bot.actions.craftItem(parsed.item, parsed.count || 1);
+          bot.chat(res);
           break;
         }
+
+        case 'mine': {
+          bot.chat(`Gathering ${parsed.count} of ${parsed.block} for us...`);
+          const res = await bot.actions.collectResource(parsed.block, parsed.count || 3);
+          bot.chat(res);
+          break;
+        }
+
+        case 'follow':
+          bot.chat(`Coming to you, ${username}!`);
+          await bot.actions.followPlayer(2);
+          break;
+
+        case 'defend':
+          bot.chat(`Protecting you, ${username}!`);
+          await bot.actions.defendPlayer();
+          break;
+
         case 'outperform':
           bot.chat(await bot.actions.outperformPlayer());
           break;
+
+        case 'status': {
+          const st = bot.actions.getStatus();
+          const inv = st.bot.inventory.map(i => `${i.count}x${i.name}`).slice(0, 4).join(', ') || 'empty';
+          bot.chat(`HP:${st.bot.health}/20 Food:${st.bot.food}/20 | Items: [${inv}] | Wood: ${st.bot.score.woodLogs} vs ${st.player.estimatedScore.woodLogs}`);
+          break;
+        }
+
         case 'stop':
           bot.actions.stopAll();
           bot.chat('Stopped current actions.');
           break;
+
+        case 'unknown':
+          if (rawMessage.startsWith('!goto')) {
+            const parts = rawMessage.trim().split(/\s+/);
+            if (parts.length >= 4) {
+              await bot.actions.moveTo(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
+              bot.chat(`Navigating to ${parts[1]}, ${parts[2]}, ${parts[3]}.`);
+            }
+          }
+          break;
       }
     } catch (err) {
-      bot.chat(`Error: ${err.message}`);
+      console.error(`[Chat Action Error]: ${err.message}`);
+      bot.chat(`Could not complete: ${err.message}`);
     }
   }
 
@@ -295,15 +473,20 @@ function createAgent(customOptions = {}) {
 
     async collectResource(blockName, count = 1) {
       const targetName = blockName.toLowerCase();
-      const blockInfo = mcData.blocksByName[targetName];
-      if (!blockInfo) {
-        throw new Error(`Unknown block "${blockName}" in Minecraft ${bot.version}.`);
-      }
+      const isWood = targetName.includes('log') || targetName.includes('wood') || targetName.includes('tree');
 
       let collectedCount = 0;
       for (let i = 0; i < count; i++) {
         const block = bot.findBlock({
-          matching: blockInfo.id,
+          matching: (b) => {
+            if (!b) return false;
+            if (isWood) return b.name.includes('_log');
+            if (targetName.includes('stone') || targetName.includes('cobble')) return b.name === 'stone' || b.name === 'cobblestone';
+            if (targetName.includes('iron')) return b.name.includes('iron_ore');
+            if (targetName.includes('coal')) return b.name.includes('coal_ore');
+            if (targetName.includes('dirt')) return b.name === 'dirt' || b.name === 'grass_block';
+            return b.name === targetName;
+          },
           maxDistance: 48
         });
 
@@ -311,7 +494,7 @@ function createAgent(customOptions = {}) {
           throw new Error(`Could not find "${blockName}" within 48 blocks. Collected ${collectedCount}/${count}.`);
         }
 
-        bot.chat(`Harvesting ${blockName} at ${block.position}...`);
+        bot.chat(`Harvesting ${block.name} at (${block.position.x}, ${block.position.y}, ${block.position.z})...`);
         await bot.collectBlock.collect(block);
         collectedCount++;
       }
@@ -320,35 +503,121 @@ function createAgent(customOptions = {}) {
     },
 
     async craftItem(itemName, count = 1) {
-      const itemInfo = mcData.itemsByName[itemName.toLowerCase()];
+      const target = itemName.toLowerCase().replace(/\s+/g, '_');
+      const itemInfo = mcData.itemsByName[target];
       if (!itemInfo) {
         throw new Error(`Unknown item "${itemName}".`);
       }
 
-      const recipes = bot.recipesFor(itemInfo.id, null, 1, null);
-      if (!recipes || recipes.length === 0) {
-        // Try with crafting table nearby
-        const craftingTable = bot.findBlock({
-          matching: mcData.blocksByName.crafting_table.id,
-          maxDistance: 16
-        });
-
-        const tableRecipes = bot.recipesFor(itemInfo.id, null, 1, craftingTable);
-        if (!tableRecipes || tableRecipes.length === 0) {
-          throw new Error(`Missing ingredients or crafting table to craft ${itemName}.`);
+      // 1. Crafting table
+      if (target === 'crafting_table') {
+        const existing = countItem('crafting_table');
+        if (existing >= count) {
+          return `I already have ${existing} crafting table(s) in my inventory!`;
         }
 
-        if (craftingTable) {
-          await bot.pathfinder.goto(new goals.GoalGetToBlock(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z));
-          await bot.craft(tableRecipes[0], count, craftingTable);
-          return `Crafted ${count} ${itemName} using crafting table.`;
-        } else {
-          throw new Error(`Crafting ${itemName} requires a 3x3 crafting table nearby.`);
+        // Check planks
+        let plankCount = countItem('planks');
+        if (plankCount < 4) {
+          let logCount = countItem('log');
+          if (logCount < 1) {
+            bot.chat('I need wood first! Gathering an oak log...');
+            await this.collectResource('oak_log', 1);
+          }
+
+          // Craft logs into planks
+          const logItem = bot.inventory.items().find(i => i.name.includes('_log'));
+          if (logItem) {
+            const plankType = logItem.name.replace('_log', '_planks');
+            const plankItem = mcData.itemsByName[plankType] || mcData.itemsByName.oak_planks;
+            const plankRecipes = bot.recipesFor(plankItem.id, null, 1, null);
+            if (plankRecipes.length > 0) {
+              await bot.craft(plankRecipes[0], 1, null);
+            }
+          }
+        }
+
+        const tableRecipes = bot.recipesFor(itemInfo.id, null, 1, null);
+        if (!tableRecipes || tableRecipes.length === 0) {
+          throw new Error('Not enough planks to craft crafting table.');
+        }
+        await bot.craft(tableRecipes[0], count, null);
+        return `Successfully crafted ${count} crafting table!`;
+      }
+
+      // 2. Planks
+      if (target.includes('plank')) {
+        let logCount = countItem('log');
+        if (logCount < 1) {
+          bot.chat('Gathering wood to craft planks...');
+          await this.collectResource('oak_log', 1);
+        }
+        const logItem = bot.inventory.items().find(i => i.name.includes('_log'));
+        const plankType = logItem ? logItem.name.replace('_log', '_planks') : 'oak_planks';
+        const plankItem = mcData.itemsByName[plankType] || mcData.itemsByName.oak_planks;
+        const recipes = bot.recipesFor(plankItem.id, null, 1, null);
+        if (!recipes || recipes.length === 0) throw new Error('Cannot craft planks from available logs.');
+        await bot.craft(recipes[0], count, null);
+        return `Crafted ${count * 4} ${plankType}!`;
+      }
+
+      // 3. Stick
+      if (target === 'stick') {
+        let plankCount = countItem('planks');
+        if (plankCount < 2) {
+          await this.craftItem('oak_planks', 1);
+        }
+        const recipes = bot.recipesFor(itemInfo.id, null, 1, null);
+        if (!recipes || recipes.length === 0) throw new Error('Not enough planks for sticks.');
+        await bot.craft(recipes[0], count, null);
+        return `Crafted ${count * 4} sticks!`;
+      }
+
+      // 4. Generic 2x2 crafting
+      let recipes = bot.recipesFor(itemInfo.id, null, 1, null);
+      if (recipes && recipes.length > 0) {
+        await bot.craft(recipes[0], count, null);
+        return `Crafted ${count} ${itemName} in 2x2 grid.`;
+      }
+
+      // 5. 3x3 crafting with table
+      let craftingTable = bot.findBlock({
+        matching: mcData.blocksByName.crafting_table.id,
+        maxDistance: 16
+      });
+
+      if (!craftingTable) {
+        const tableItem = bot.inventory.items().find(i => i.name === 'crafting_table');
+        if (tableItem && bot.entity) {
+          const feet = bot.entity.position.floored();
+          const solidBlock = bot.findBlock({
+            matching: b => b.boundingBox === 'block' && b.position.distanceTo(feet) < 3 && b.position.y <= feet.y,
+            maxDistance: 4
+          });
+          if (solidBlock) {
+            try {
+              await bot.equip(tableItem, 'hand');
+              await bot.placeBlock(solidBlock, new Vec3(0, 1, 0));
+              craftingTable = bot.findBlock({
+                matching: mcData.blocksByName.crafting_table.id,
+                maxDistance: 5
+              });
+            } catch (_) {}
+          }
         }
       }
 
-      await bot.craft(recipes[0], count, null);
-      return `Crafted ${count} ${itemName} in 2x2 inventory grid.`;
+      if (craftingTable) {
+        await bot.pathfinder.goto(new goals.GoalGetToBlock(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z));
+        const tableRecipes = bot.recipesFor(itemInfo.id, null, 1, craftingTable);
+        if (!tableRecipes || tableRecipes.length === 0) {
+          throw new Error(`Missing ingredients to craft ${itemName} at crafting table.`);
+        }
+        await bot.craft(tableRecipes[0], count, craftingTable);
+        return `Crafted ${count} ${itemName} using crafting table.`;
+      }
+
+      throw new Error(`Cannot craft ${itemName}: missing ingredients or crafting table.`);
     },
 
     async defendPlayer() {
