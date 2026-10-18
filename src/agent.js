@@ -474,28 +474,51 @@ function createAgent(customOptions = {}) {
     async collectResource(blockName, count = 1) {
       const targetName = blockName.toLowerCase();
       const isWood = targetName.includes('log') || targetName.includes('wood') || targetName.includes('tree');
+      const botPos = bot.entity ? bot.entity.position : new Vec3(0, 0, 0);
 
       let collectedCount = 0;
       for (let i = 0; i < count; i++) {
-        const block = bot.findBlock({
+        // Prioritize ground-level reachable blocks (so bot does not try to path into tree canopies)
+        let block = bot.findBlock({
           matching: (b) => {
             if (!b) return false;
-            if (isWood) return b.name.includes('_log');
-            if (targetName.includes('stone') || targetName.includes('cobble')) return b.name === 'stone' || b.name === 'cobblestone';
+            if (isWood) {
+              if (!b.name.includes('_log')) return false;
+              const dy = b.position.y - botPos.y;
+              return dy >= -1 && dy <= 3;
+            }
+            if (targetName.includes('stone') || targetName.includes('cobble')) {
+              return (b.name === 'stone' || b.name === 'cobblestone') && Math.abs(b.position.y - botPos.y) <= 3;
+            }
             if (targetName.includes('iron')) return b.name.includes('iron_ore');
             if (targetName.includes('coal')) return b.name.includes('coal_ore');
             if (targetName.includes('dirt')) return b.name === 'dirt' || b.name === 'grass_block';
             return b.name === targetName;
           },
-          maxDistance: 48
+          maxDistance: 32
         });
 
+        // Fallback to wider search if reachable ground block not found
         if (!block) {
-          throw new Error(`Could not find "${blockName}" within 48 blocks. Collected ${collectedCount}/${count}.`);
+          block = bot.findBlock({
+            matching: (b) => {
+              if (!b) return false;
+              if (isWood) return b.name.includes('_log');
+              return b.name === targetName;
+            },
+            maxDistance: 48
+          });
+        }
+
+        if (!block) {
+          throw new Error(`Could not find reachable "${blockName}" nearby.`);
         }
 
         bot.chat(`Harvesting ${block.name} at (${block.position.x}, ${block.position.y}, ${block.position.z})...`);
         await bot.collectBlock.collect(block);
+
+        // Wait a few ticks for item pickup to register in inventory
+        await bot.waitForTicks(8);
         collectedCount++;
       }
 
@@ -533,11 +556,27 @@ function createAgent(customOptions = {}) {
             const plankRecipes = bot.recipesFor(plankItem.id, null, 1, null);
             if (plankRecipes.length > 0) {
               await bot.craft(plankRecipes[0], 1, null);
+              await bot.waitForTicks(4);
             }
           }
         }
 
-        const tableRecipes = bot.recipesFor(itemInfo.id, null, 1, null);
+        let tableRecipes = bot.recipesFor(itemInfo.id, null, 1, null);
+        if (!tableRecipes || tableRecipes.length === 0) {
+          // Retry crafting planks from any available log
+          const anyLog = bot.inventory.items().find(i => i.name.includes('_log'));
+          if (anyLog) {
+            const plankType = anyLog.name.replace('_log', '_planks');
+            const plankItem = mcData.itemsByName[plankType] || mcData.itemsByName.oak_planks;
+            const plankRecipes = bot.recipesFor(plankItem.id, null, 1, null);
+            if (plankRecipes.length > 0) {
+              await bot.craft(plankRecipes[0], 1, null);
+              await bot.waitForTicks(4);
+            }
+          }
+          tableRecipes = bot.recipesFor(itemInfo.id, null, 1, null);
+        }
+
         if (!tableRecipes || tableRecipes.length === 0) {
           throw new Error('Not enough planks to craft crafting table.');
         }
