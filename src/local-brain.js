@@ -149,7 +149,11 @@ What action will you take?`
   async heuristicFallback(status, chatMsg) {
     // 1. Follow direct chat instructions
     if (chatMsg) {
-      const lower = chatMsg.toLowerCase();
+      const lower = chatMsg.toLowerCase().trim();
+      if (lower === 'hi' || lower === 'hello' || lower === 'hey') {
+        this.bot.actions.sendChat(`Hey ${config.targetPlayer}! I am ready. What are we gathering?`);
+        return;
+      }
       if (lower.includes('come') || lower.includes('follow') || lower.includes('here')) {
         await this.bot.actions.followPlayer(2);
         this.bot.actions.sendChat(`Coming to you, ${config.targetPlayer}!`);
@@ -187,10 +191,14 @@ What action will you take?`
       }
     }
 
-    // 4. Stay close to player if far away
-    if (status.player.distance > 8) {
+    // 4. Stay close to player if far away (within loaded range)
+    if (status.player.distance > 8 && status.player.distance < 48) {
       console.log(`[Heuristic Brain] AURTX is ${status.player.distance}m away. Moving closer.`);
-      await this.bot.actions.followPlayer(3);
+      try {
+        await this.bot.actions.followPlayer(3);
+      } catch (err) {
+        console.log(`[Heuristic Brain] Cannot follow right now: ${err.message}`);
+      }
     }
   }
 

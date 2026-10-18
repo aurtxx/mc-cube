@@ -5,7 +5,6 @@ const { createMcpServer } = require('../src/mcp-server');
 const { LocalBrain } = require('../src/local-brain');
 const config = require('../config');
 
-// Locations to watch
 const CANDIDATE_LOGS = [
   path.resolve(__dirname, '..', 'mclauncher-env', '.minecraft', 'logs', 'latest.log'),
   'C:\\Users\\aurtx\\AppData\\Roaming\\PolyMC\\instances\\mc-cube\\.minecraft\\logs\\latest.log'
@@ -15,6 +14,7 @@ let brain = null;
 let activeBot = null;
 
 function setupAgentWithBrain(port) {
+  if (activeBot) return;
   activeBot = createAgent({ port });
 
   activeBot.once('spawn', () => {
@@ -23,6 +23,19 @@ function setupAgentWithBrain(port) {
 
     brain = new LocalBrain(activeBot, tools);
     brain.start(4000);
+  });
+
+  activeBot.on('end', () => {
+    console.log('[AutoConnect] Bot disconnected. Reconnecting in 3 seconds...');
+    if (brain) { brain.stop(); brain = null; }
+    activeBot = null;
+    setTimeout(() => {
+      setupAgentWithBrain(port);
+    }, 3000);
+  });
+
+  activeBot.on('kicked', (reason) => {
+    console.log('[AutoConnect] Bot kicked from server:', reason);
   });
 
   return activeBot;
@@ -43,46 +56,55 @@ function startLogWatcher() {
   console.log('   LAN World Auto-Detector & Agent Connector         ');
   console.log('   Tracking & Competing with Player: ' + config.targetPlayer);
   console.log('======================================================');
-  console.log('[AutoConnect] Watching Minecraft client logs for LAN broadcast...');
+  console.log('[AutoConnect] Watching for Minecraft LAN broadcasts across all instances...');
   console.log('[AutoConnect] In Minecraft, pause the game and click "Open to LAN".');
 
-  let logFile = CANDIDATE_LOGS.find(f => fs.existsSync(f)) || CANDIDATE_LOGS[0];
-  console.log(`[AutoConnect] Actively monitoring: ${logFile}`);
+  const fileSizes = {};
 
-  let lastSize = 0;
-  if (fs.existsSync(logFile)) {
-    lastSize = fs.statSync(logFile).size;
+  for (const file of CANDIDATE_LOGS) {
+    if (fs.existsSync(file)) {
+      fileSizes[file] = fs.statSync(file).size;
+      console.log(`[AutoConnect] Actively watching: ${file}`);
+    } else {
+      fileSizes[file] = 0;
+    }
   }
 
   const checkInterval = setInterval(() => {
-    if (!fs.existsSync(logFile)) return;
+    if (activeBot) return;
 
-    const stats = fs.statSync(logFile);
-    if (stats.size > lastSize) {
-      const stream = fs.createReadStream(logFile, {
-        start: lastSize,
-        end: stats.size,
-        encoding: 'utf8'
-      });
+    for (const file of CANDIDATE_LOGS) {
+      if (!fs.existsSync(file)) continue;
 
-      lastSize = stats.size;
+      const stats = fs.statSync(file);
+      const prevSize = fileSizes[file] || 0;
 
-      stream.on('data', (chunk) => {
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          const match = line.match(/(?:Started serving on|Local game hosted on port)\s+(\d{4,5})/i);
-          if (match && !activeBot) {
-            const port = parseInt(match[1], 10);
-            console.log(`\n>>> [LAN DETECTED] Minecraft hosted on port: ${port}! <<<`);
-            console.log(`[AutoConnect] Connecting Mineflayer agent with MCP & LocalBrain to localhost:${port}...`);
-            setupAgentWithBrain(port);
-            clearInterval(checkInterval);
-            break;
+      if (stats.size > prevSize) {
+        const stream = fs.createReadStream(file, {
+          start: prevSize,
+          end: stats.size,
+          encoding: 'utf8'
+        });
+
+        fileSizes[file] = stats.size;
+
+        stream.on('data', (chunk) => {
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            const match = line.match(/(?:Started serving on|Local game hosted on port)\s+(\d{4,5})/i);
+            if (match && !activeBot) {
+              const port = parseInt(match[1], 10);
+              console.log(`\n>>> [LAN DETECTED] Minecraft hosted on port: ${port}! (from ${path.basename(path.dirname(path.dirname(file)))}) <<<`);
+              console.log(`[AutoConnect] Connecting Mineflayer agent with MCP & LocalBrain to localhost:${port}...`);
+              setupAgentWithBrain(port);
+              clearInterval(checkInterval);
+              break;
+            }
           }
-        }
-      });
-    } else if (stats.size < lastSize) {
-      lastSize = 0;
+        });
+      } else if (stats.size < prevSize) {
+        fileSizes[file] = 0;
+      }
     }
   }, 1000);
 

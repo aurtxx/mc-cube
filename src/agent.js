@@ -4,8 +4,13 @@ const collectBlock = require('mineflayer-collectblock').plugin;
 const autoEat = require('mineflayer-auto-eat').plugin;
 const armorManager = require('mineflayer-armor-manager');
 const pvp = require('mineflayer-pvp').plugin;
-const { mineflayer: mineflayerViewer } = require('prismarine-viewer');
 const mcDataBuilder = require('minecraft-data');
+let mineflayerViewer = null;
+try {
+  mineflayerViewer = require('prismarine-viewer').mineflayer;
+} catch (_) {
+  // Optional dependency: canvas not present
+}
 const config = require('../config');
 
 function createAgent(customOptions = {}) {
@@ -67,22 +72,26 @@ function createAgent(customOptions = {}) {
 
   // Periodic Player Perception Loop
   function updatePlayerPerception() {
-    const player = bot.players[targetPlayerName]?.entity;
-    if (player) {
+    const playerObj = Object.values(bot.players).find(p => p.username.toLowerCase() === targetPlayerName.toLowerCase());
+    if (playerObj) {
       bot.playerTracker.online = true;
-      bot.playerTracker.position = player.position.clone();
-      bot.playerTracker.distance = Math.round(bot.entity.position.distanceTo(player.position));
-      bot.playerTracker.heldItem = player.heldItem ? player.heldItem.name : 'empty';
-      bot.playerTracker.lastSeen = Date.now();
+      const entity = playerObj.entity;
+      if (entity && entity.position && bot.entity && bot.entity.position) {
+        bot.playerTracker.position = entity.position.clone();
+        bot.playerTracker.distance = Math.round(bot.entity.position.distanceTo(entity.position));
+        bot.playerTracker.heldItem = entity.heldItem ? entity.heldItem.name : 'empty';
+        bot.playerTracker.lastSeen = Date.now();
 
-      // Check if player held a newly gathered resource
-      if (bot.playerTracker.heldItem.includes('log')) {
-        bot.playerTracker.recentActions.unshift(`Harvesting ${bot.playerTracker.heldItem}`);
-      } else if (bot.playerTracker.heldItem.includes('ore') || bot.playerTracker.heldItem.includes('raw_')) {
-        bot.playerTracker.recentActions.unshift(`Mining ${bot.playerTracker.heldItem}`);
-      }
-      if (bot.playerTracker.recentActions.length > 5) {
-        bot.playerTracker.recentActions.pop();
+        if (bot.playerTracker.heldItem.includes('log')) {
+          bot.playerTracker.recentActions.unshift(`Harvesting ${bot.playerTracker.heldItem}`);
+        } else if (bot.playerTracker.heldItem.includes('ore') || bot.playerTracker.heldItem.includes('raw_')) {
+          bot.playerTracker.recentActions.unshift(`Mining ${bot.playerTracker.heldItem}`);
+        }
+        if (bot.playerTracker.recentActions.length > 5) {
+          bot.playerTracker.recentActions.pop();
+        }
+      } else {
+        bot.playerTracker.distance = 999;
       }
     } else {
       bot.playerTracker.online = false;
@@ -113,7 +122,7 @@ function createAgent(customOptions = {}) {
       bannedFood: ['rotten_flesh', 'pufferfish', 'poisonous_potato', 'spider_eye']
     };
 
-    if (config.enableViewer) {
+    if (config.enableViewer && mineflayerViewer) {
       try {
         mineflayerViewer(bot, { port: config.viewerPort, firstPerson: false });
         console.log(`[Viewer] Web 3D visualizer running at http://localhost:${config.viewerPort}`);
@@ -122,7 +131,28 @@ function createAgent(customOptions = {}) {
       }
     }
 
-    bot.chat(`CubeAgent online! Tracking ${targetPlayerName}. Type "!help" for commands.`);
+    // Guard against NaN lookAt calls which cause 'Invalid move player packet' kicks
+    const originalLookAt = bot.lookAt.bind(bot);
+    bot.lookAt = async (point, force) => {
+      if (!point || isNaN(point.x) || isNaN(point.y) || isNaN(point.z)) {
+        return;
+      }
+      return originalLookAt(point, force);
+    };
+
+    // Auto-swim: prevent drowning when spawned in water
+    bot.on('physicsTick', () => {
+      if (bot.entity && bot.entity.isInWater) {
+        bot.setControlState('jump', true);
+      }
+    });
+
+    bot.on('death', () => {
+      console.log('[Agent] Bot died! Clearing actions and respawning...');
+      bot.actions.stopAll();
+    });
+
+    bot.chat(`CubeAgent online! Tracking ${targetPlayerName}. Type "hi" or "help" for commands.`);
 
     // Start perception loop
     setInterval(updatePlayerPerception, 1000);
@@ -143,9 +173,11 @@ function createAgent(customOptions = {}) {
     }
   });
 
-  // Chat tracking
+  // Chat tracking & natural language command handling
   bot.on('chat', (username, message) => {
-    if (username === targetPlayerName) {
+    if (username === bot.username) return;
+
+    if (username.toLowerCase() === targetPlayerName.toLowerCase()) {
       bot.playerTracker.recentChats.unshift({
         message,
         timestamp: Date.now()
@@ -155,26 +187,31 @@ function createAgent(customOptions = {}) {
       }
     }
 
-    if (username === bot.username) return;
-    if (!message.startsWith('!')) return;
-
-    handleManualCommand(username, message);
+    handleIncomingChat(username, message);
   });
 
-  // Manual chat command fallback
-  async function handleManualCommand(username, message) {
-    const args = message.slice(1).trim().split(/ +/);
+  // Natural Language & Command Parser
+  async function handleIncomingChat(username, rawMessage) {
+    const message = rawMessage.startsWith('!') ? rawMessage.slice(1).trim() : rawMessage.trim();
+    const args = message.split(/ +/);
     const command = args.shift().toLowerCase();
 
+    console.log(`[Chat Input from ${username}]: "${rawMessage}" -> command: "${command}"`);
+
     try {
+      if (command === 'hi' || command === 'hello' || command === 'hey') {
+        bot.chat(`Hey ${username}! I am CubeAgent. What are we doing?`);
+        return;
+      }
+
       switch (command) {
         case 'help':
-          bot.chat('Commands: !come, !goto <x y z>, !mine <block> [count], !status, !outperform, !stop');
+          bot.chat('Commands: come, follow, mine <block>, status, outperform, stop');
           break;
         case 'come':
         case 'follow':
           await bot.actions.followPlayer(2);
-          bot.chat(`Following ${username}!`);
+          bot.chat(`Navigating to ${username}!`);
           break;
         case 'goto':
           if (args.length >= 3) {
@@ -186,11 +223,13 @@ function createAgent(customOptions = {}) {
           if (args.length >= 1) {
             const count = args[1] ? parseInt(args[1], 10) : 1;
             await bot.actions.collectResource(args[0], count);
+          } else {
+            bot.chat('Usage: mine <block_name> [count]');
           }
           break;
         case 'status': {
           const st = bot.actions.getStatus();
-          bot.chat(`HP:${st.bot.health} Food:${st.bot.food} | Target ${st.player.username}: ${st.player.online ? st.player.distance + 'm away' : 'offline'}`);
+          bot.chat(`HP:${st.bot.health}/20 Food:${st.bot.food}/20 | Wood: ${st.bot.score.woodLogs} vs ${st.player.estimatedScore.woodLogs}`);
           break;
         }
         case 'outperform':
@@ -238,9 +277,12 @@ function createAgent(customOptions = {}) {
     },
 
     async followPlayer(distance = 2) {
-      const target = bot.players[targetPlayerName]?.entity;
-      if (!target) {
-        throw new Error(`Player ${targetPlayerName} is not in loaded chunks or offline.`);
+      updatePlayerPerception();
+      const playerObj = Object.values(bot.players).find(p => p.username.toLowerCase() === targetPlayerName.toLowerCase());
+      const target = playerObj?.entity;
+      if (!target || !target.position) {
+        bot.chat(`Cannot see you, ${targetPlayerName}! Come closer so chunks load, or type "!goto <x> <y> <z>".`);
+        return `Player ${targetPlayerName} is not in loaded chunks.`;
       }
       bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true);
       return `Now following ${targetPlayerName} within ${distance} blocks.`;
