@@ -22,3 +22,13 @@ world_the_end/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Standalone MC Launcher environment (heavy binaries & runtime)
+mclauncher-env/assets
+mclauncher-env/libraries
+mclauncher-env/natives/
+mclauncher-env/.minecraft/logs/
+mclauncher-env/.minecraft/saves/
+mclauncher-env/.minecraft/resourcepacks/
+mclauncher-env/.minecraft/.fabric/
+

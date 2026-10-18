@@ -5,7 +5,10 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "mc:launch": "node scripts/launch-client.js",
+    "mc:lan": "node scripts/watch-and-connect.js",
+    "bot:2390": "node src/index.js 2390"
   },
   "keywords": [
     "mineflayer",
