@@ -462,12 +462,22 @@ function createAgent(customOptions = {}) {
       updatePlayerPerception();
       const playerObj = Object.values(bot.players).find(p => p.username.toLowerCase() === targetPlayerName.toLowerCase());
       const target = playerObj?.entity;
-      if (!target || !target.position) {
-        bot.chat(`Cannot see you, ${targetPlayerName}! Come closer so chunks load, or type "!goto <x> <y> <z>".`);
-        return `Player ${targetPlayerName} is not in loaded chunks.`;
+
+      if (target && target.position) {
+        bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true);
+        return `Now following ${targetPlayerName} within a radius of ${distance} blocks.`;
       }
-      bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true);
-      return `Now following ${targetPlayerName} within a radius of ${distance} blocks.`;
+
+      // If player entity is outside current chunk view, navigate to last known position
+      const lastPos = bot.playerTracker.position;
+      if (lastPos) {
+        bot.chat(`Navigating towards your last known position at (${lastPos.x}, ${lastPos.y}, ${lastPos.z})...`);
+        bot.pathfinder.setGoal(new goals.GoalNear(lastPos.x, lastPos.y, lastPos.z, distance));
+        return `Navigating towards last known position of ${targetPlayerName}.`;
+      }
+
+      bot.chat(`Cannot see you yet, ${targetPlayerName}! Come closer so chunks load.`);
+      return `Player ${targetPlayerName} is not in loaded chunks.`;
     },
 
     async moveTo(x, y, z) {
@@ -487,15 +497,21 @@ function createAgent(customOptions = {}) {
           matching: (b) => {
             if (!b) return false;
             if (isWood) {
-              if (!b.name.includes('_log')) return false;
-              const dy = b.position.y - botPos.y;
-              return dy >= -1 && dy <= 3;
+              if (!b.name || !b.name.includes('_log')) return false;
+              // b.position can be null during palette checks in Mineflayer!
+              if (b.position && botPos) {
+                const dy = b.position.y - botPos.y;
+                return dy >= -1 && dy <= 3;
+              }
+              return true;
             }
             if (targetName.includes('stone') || targetName.includes('cobble')) {
-              return (b.name === 'stone' || b.name === 'cobblestone') && Math.abs(b.position.y - botPos.y) <= 3;
+              if (b.name !== 'stone' && b.name !== 'cobblestone') return false;
+              if (b.position && botPos) return Math.abs(b.position.y - botPos.y) <= 3;
+              return true;
             }
-            if (targetName.includes('iron')) return b.name.includes('iron_ore');
-            if (targetName.includes('coal')) return b.name.includes('coal_ore');
+            if (targetName.includes('iron')) return b.name && b.name.includes('iron_ore');
+            if (targetName.includes('coal')) return b.name && b.name.includes('coal_ore');
             if (targetName.includes('dirt')) return b.name === 'dirt' || b.name === 'grass_block';
             return b.name === targetName;
           },
