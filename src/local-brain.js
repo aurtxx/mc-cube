@@ -157,7 +157,7 @@ What action will you take?`
         return;
       }
       if (lower.includes('come') || lower.includes('follow') || lower.includes('here')) {
-        await this.bot.actions.followPlayer(2);
+        await this.bot.actions.followPlayer(5);
         return;
       }
       if (lower.includes('wood') || lower.includes('log') || lower.includes('tree')) {
@@ -193,10 +193,10 @@ What action will you take?`
       }
     }
 
-    // 4. Stay close to player if far away (within loaded range)
-    if (status.player.distance > 10 && status.player.distance < 48) {
+    // 4. Stay close to player if far away (within loaded range, maintain radius of 5)
+    if (status.player.distance > 8 && status.player.distance < 48) {
       try {
-        await this.bot.actions.followPlayer(3);
+        await this.bot.actions.followPlayer(5);
       } catch (err) {
         console.log(`[Heuristic Brain] Cannot follow right now: ${err.message}`);
       }

@@ -323,9 +323,11 @@ function createAgent(customOptions = {}) {
       return { intent: 'mine', block: rawTarget.replace(/\s+/g, '_'), count };
     }
 
-    // 3. Follow / Come
-    if (/\b(?:follow|come|here|tp|teleport)\b/i.test(msg)) {
-      return { intent: 'follow' };
+    // 3. Follow / Come (supports "follow player in radius of 5", "follow me", "come here")
+    const followMatch = msg.match(/(?:follow|come|stay\s+close|walk\s+with)(?:\s+(?:me|player|aurtx|with\s+me))?(?:\s+(?:within|in|radius\s+of|distance\s+of)?\s*(\d+))?/i);
+    if (followMatch || /\b(?:follow|come|here|tp|teleport)\b/i.test(msg)) {
+      const radius = followMatch && followMatch[1] ? parseInt(followMatch[1], 10) : 5;
+      return { intent: 'follow', radius };
     }
 
     // 4. Defend / Protect
@@ -381,10 +383,12 @@ function createAgent(customOptions = {}) {
           break;
         }
 
-        case 'follow':
-          bot.chat(`Coming to you, ${username}!`);
-          await bot.actions.followPlayer(2);
+        case 'follow': {
+          const radius = parsed.radius || 5;
+          bot.chat(`Following ${username} within a radius of ${radius} blocks!`);
+          await bot.actions.followPlayer(radius);
           break;
+        }
 
         case 'defend':
           bot.chat(`Protecting you, ${username}!`);
@@ -454,7 +458,7 @@ function createAgent(customOptions = {}) {
       };
     },
 
-    async followPlayer(distance = 2) {
+    async followPlayer(distance = 5) {
       updatePlayerPerception();
       const playerObj = Object.values(bot.players).find(p => p.username.toLowerCase() === targetPlayerName.toLowerCase());
       const target = playerObj?.entity;
@@ -463,7 +467,7 @@ function createAgent(customOptions = {}) {
         return `Player ${targetPlayerName} is not in loaded chunks.`;
       }
       bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true);
-      return `Now following ${targetPlayerName} within ${distance} blocks.`;
+      return `Now following ${targetPlayerName} within a radius of ${distance} blocks.`;
     },
 
     async moveTo(x, y, z) {

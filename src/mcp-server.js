@@ -146,7 +146,7 @@ function createMcpServer(bot) {
         }
 
         case 'follow_player': {
-          const dist = args?.distance || 2;
+          const dist = args?.distance || 5;
           resultText = await bot.actions.followPlayer(dist);
           break;
         }
